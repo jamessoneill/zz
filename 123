@@ -1,0 +1,259 @@
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.Logging;
+using Microsoft.ApplicationInsights;
+using System.Diagnostics;
+using System.Threading.Tasks;
+using System.Collections.Generic;
+using Xunit;
+using Moq;
+
+namespace LatencyTracker
+{
+    public class LatencyMiddleware
+    {
+        private readonly RequestDelegate _next;
+        private readonly ILogger<LatencyMiddleware> _logger;
+        private readonly TelemetryClient _telemetryClient;
+
+        public LatencyMiddleware(RequestDelegate next, ILogger<LatencyMiddleware> logger, TelemetryClient telemetryClient)
+        {
+            _next = next;
+            _logger = logger;
+            _telemetryClient = telemetryClient;
+        }
+
+        public async Task InvokeAsync(HttpContext context)
+        {
+            var stopwatch = Stopwatch.StartNew();
+
+            try
+            {
+                await _next(context);
+            }
+            finally
+            {
+                stopwatch.Stop();
+                var elapsedMilliseconds = stopwatch.ElapsedMilliseconds;
+
+                _logger.LogInformation($"Request [{context.Request.Method}] {context.Request.Path} took {elapsedMilliseconds} ms");
+
+                // Send latency to Application Insights
+                _telemetryClient.TrackMetric("RequestLatency", elapsedMilliseconds, new Dictionary<string, string>
+                {
+                    { "Method", context.Request.Method },
+                    { "Path", context.Request.Path }
+                });
+            }
+        }
+    }
+
+    public static class LatencyMiddlewareExtensions
+    {
+        public static IApplicationBuilder UseLatencyTracker(this IApplicationBuilder builder)
+        {
+            return builder.UseMiddleware<LatencyMiddleware>();
+        }
+    }
+}
+
+// Example HelloWorldController
+using Microsoft.AspNetCore.Mvc;
+
+namespace LatencyTracker.Controllers
+{
+    [ApiController]
+    [Route("api/[controller]")]
+    public class HelloWorldController : ControllerBase
+    {
+        [HttpGet]
+        public IActionResult Get()
+        {
+            return Ok("Hello, World!");
+        }
+
+        [HttpGet("custom")]
+        public IActionResult CustomCall()
+        {
+            return Ok("Custom endpoint response");
+        }
+    }
+}
+
+// In the Startup.cs or Program.cs
+// Add the middleware in the HTTP request pipeline
+using Microsoft.AspNetCore.Builder;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using Microsoft.ApplicationInsights;
+
+var builder = WebApplication.CreateBuilder(args);
+
+// Add Application Insights Telemetry Client
+builder.Services.AddSingleton<TelemetryClient>();
+
+var app = builder.Build();
+
+app.UseLatencyTracker(); // Add the latency tracker middleware
+
+app.MapControllers();
+
+app.Run();
+
+// Unit Tests
+namespace LatencyTracker.Tests
+{
+    public class LatencyMiddlewareTests
+    {
+        [Fact]
+        public async Task Middleware_Should_Log_And_Track_Latency()
+        {
+            // Arrange
+            var mockLogger = new Mock<ILogger<LatencyMiddleware>>();
+            var mockTelemetryClient = new Mock<TelemetryClient>();
+            var context = new DefaultHttpContext();
+            context.Request.Method = "GET";
+            context.Request.Path = "/test";
+            var next = new RequestDelegate((innerContext) => Task.CompletedTask);
+
+            var middleware = new LatencyMiddleware(next, mockLogger.Object, mockTelemetryClient.Object);
+
+            // Act
+            await middleware.InvokeAsync(context);
+
+            // Assert
+            mockLogger.Verify(logger => logger.LogInformation(
+                It.Is<string>(s => s.Contains("Request [GET] /test took")),
+                It.IsAny<object[]>()), Times.Once);
+
+            mockTelemetryClient.Verify(tc => tc.TrackMetric(
+                "RequestLatency",
+                It.IsAny<double>(),
+                It.Is<Dictionary<string, string>>(tags => tags["Method"] == "GET" && tags["Path"] == "/test")), Times.Once);
+        }
+
+        [Fact]
+        public async Task Middleware_Should_Propagate_Exceptions()
+        {
+            // Arrange
+            var mockLogger = new Mock<ILogger<LatencyMiddleware>>();
+            var mockTelemetryClient = new Mock<TelemetryClient>();
+            var context = new DefaultHttpContext();
+            var next = new RequestDelegate((innerContext) => throw new System.Exception("Test Exception"));
+
+            var middleware = new LatencyMiddleware(next, mockLogger.Object, mockTelemetryClient.Object);
+
+            // Act & Assert
+            await Assert.ThrowsAsync<System.Exception>(() => middleware.InvokeAsync(context));
+
+            mockLogger.Verify(logger => logger.LogInformation(It.IsAny<string>(), It.IsAny<object[]>()), Times.Never);
+            mockTelemetryClient.Verify(tc => tc.TrackMetric(It.IsAny<string>(), It.IsAny<double>(), It.IsAny<Dictionary<string, string>>()), Times.Never);
+        }
+    }
+}
+---------- Forwarded message ---------
+From: James ONeill <james.stephen.oneill@gmail.com>
+Date: Fri, Jan 10, 2025 at 10:48 AM
+Subject: test1
+To: James ONeill <james.stephen.oneill@gmail.com>
+
+
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.Logging;
+using Microsoft.ApplicationInsights;
+using System.Diagnostics;
+using System.Threading.Tasks;
+
+namespace LatencyTracker
+{
+    public class LatencyMiddleware
+    {
+        private readonly RequestDelegate _next;
+        private readonly ILogger<LatencyMiddleware> _logger;
+        private readonly TelemetryClient _telemetryClient;
+
+        public LatencyMiddleware(RequestDelegate next, ILogger<LatencyMiddleware> logger, TelemetryClient telemetryClient)
+        {
+            _next = next;
+            _logger = logger;
+            _telemetryClient = telemetryClient;
+        }
+
+        public async Task InvokeAsync(HttpContext context)
+        {
+            var stopwatch = Stopwatch.StartNew();
+
+            try
+            {
+                await _next(context);
+            }
+            finally
+            {
+                stopwatch.Stop();
+                var elapsedMilliseconds = stopwatch.ElapsedMilliseconds;
+
+                _logger.LogInformation($"Request [{context.Request.Method}] {context.Request.Path} took {elapsedMilliseconds} ms");
+
+                // Send latency to Application Insights
+                _telemetryClient.TrackMetric("RequestLatency", elapsedMilliseconds, new Dictionary<string, string>
+                {
+                    { "Method", context.Request.Method },
+                    { "Path", context.Request.Path }
+                });
+            }
+        }
+    }
+
+    public static class LatencyMiddlewareExtensions
+    {
+        public static IApplicationBuilder UseLatencyTracker(this IApplicationBuilder builder)
+        {
+            return builder.UseMiddleware<LatencyMiddleware>();
+        }
+    }
+}
+
+// Example HelloWorldController
+using Microsoft.AspNetCore.Mvc;
+
+namespace LatencyTracker.Controllers
+{
+    [ApiController]
+    [Route("api/[controller]")]
+    public class HelloWorldController : ControllerBase
+    {
+        [HttpGet]
+        public IActionResult Get()
+        {
+            return Ok("Hello, World!");
+        }
+
+        [HttpGet("custom")]
+        public IActionResult CustomCall()
+        {
+            return Ok("Custom endpoint response");
+        }
+    }
+}
+
+// In the Startup.cs or Program.cs
+// Add the middleware in the HTTP request pipeline
+using Microsoft.AspNetCore.Builder;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using Microsoft.ApplicationInsights;
+
+var builder = WebApplication.CreateBuilder(args);
+
+// Add Application Insights Telemetry Client
+builder.Services.AddSingleton<TelemetryClient>();
+
+var app = builder.Build();
+
+app.UseLatencyTracker(); // Add the latency tracker middleware
+
+app.MapControllers();
+
+app.Run();
+
