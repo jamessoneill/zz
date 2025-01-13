@@ -1,0 +1,179 @@
+using System;
+using System.Collections.Concurrent;
+using System.Diagnostics;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.ApplicationInsights;
+using Microsoft.ApplicationInsights.Extensibility;
+using Microsoft.AspNetCore.Http;
+
+namespace Ubs.Acq.PositionService.Middleware
+{
+    public class EntitlementMiddleware
+    {
+        private readonly RequestDelegate _next;
+        private readonly TelemetryClient _telemetryClient;
+
+        private static readonly ConcurrentDictionary<string, ConcurrentBag<long>> LatencyMetrics = new();
+        private static readonly Timer FlushTimer;
+
+        static EntitlementMiddleware()
+        {
+            // Timer to flush metrics every 5 minutes
+            FlushTimer = new Timer(FlushMetrics, null, TimeSpan.FromMinutes(5), TimeSpan.FromMinutes(5));
+        }
+
+        public EntitlementMiddleware(RequestDelegate next, TelemetryClient telemetryClient)
+        {
+            _next = next;
+            _telemetryClient = telemetryClient ?? new TelemetryClient(new TelemetryConfiguration
+            {
+                InstrumentationKey = "default-instrumentation-key" // Default Instrumentation Key
+            });
+        }
+
+        public async Task InvokeAsync(HttpContext context)
+        {
+            var stopwatch = Stopwatch.StartNew();
+            try
+            {
+                await _next(context);
+            }
+            finally
+            {
+                stopwatch.Stop();
+                long elapsedMilliseconds = stopwatch.ElapsedMilliseconds;
+
+                string podName = Environment.GetEnvironmentVariable("POD_NAME") ?? "default-pod";
+                string key = $"{podName}|{context.Request.Path}";
+
+                var bag = LatencyMetrics.GetOrAdd(key, _ => new ConcurrentBag<long>());
+                bag.Add(elapsedMilliseconds);
+            }
+        }
+
+        private static void FlushMetrics(object state)
+        {
+            foreach (var entry in LatencyMetrics.ToArray())
+            {
+                if (!LatencyMetrics.TryRemove(entry.Key, out var bag) || bag.IsEmpty) continue;
+
+                var latencies = bag.ToArray();
+                string[] keyParts = entry.Key.Split('|');
+                string podName = keyParts[0];
+                string path = keyParts[1];
+
+                var telemetryClient = new TelemetryClient(new TelemetryConfiguration
+                {
+                    InstrumentationKey = "default-instrumentation-key" // Default Instrumentation Key
+                });
+
+                telemetryClient.TrackMetric($"RequestLatency|{podName}|{path}|Min", latencies.Min());
+                telemetryClient.TrackMetric($"RequestLatency|{podName}|{path}|Max", latencies.Max());
+                telemetryClient.TrackMetric($"RequestLatency|{podName}|{path}|Average", latencies.Average());
+            }
+        }
+    }
+}
+
+######
+
+customMetrics
+| where name startswith "RequestLatency"
+| extend Pod = split(name, "|")[1], Path = split(name, "|")[2], MetricType = split(name, "|")[3]
+| summarize MinValue = min(value), MaxValue = max(value), AverageValue = avg(value) by Pod, Path, MetricType, bin(timestamp, 5m)
+| order by timestamp desc
+
+#####
+
+using System.Collections.Concurrent;
+using System.Diagnostics;
+using System.Threading.Tasks;
+using Microsoft.ApplicationInsights;
+using Microsoft.ApplicationInsights.DataContracts;
+using Microsoft.ApplicationInsights.Extensibility;
+using Microsoft.AspNetCore.Http;
+using Microsoft.VisualStudio.TestTools.UnitTesting;
+using Moq;
+
+namespace Ubs.Acq.PositionService.Middleware.Tests
+{
+    [TestClass]
+    public class EntitlementMiddlewareTests
+    {
+        private Mock<RequestDelegate> _mockNext;
+        private Mock<TelemetryClient> _mockTelemetryClient;
+        private EntitlementMiddleware _middleware;
+
+        [TestInitialize]
+        public void Setup()
+        {
+            _mockNext = new Mock<RequestDelegate>();
+            _mockTelemetryClient = new Mock<TelemetryClient>();
+            _middleware = new EntitlementMiddleware(_mockNext.Object, _mockTelemetryClient.Object);
+        }
+
+        [TestMethod]
+        public async Task InvokeAsync_TracksLatencyMetrics()
+        {
+            // Arrange
+            var context = new DefaultHttpContext();
+            context.Request.Path = "/test";
+            _mockNext.Setup(n => n(It.IsAny<HttpContext>())).Returns(Task.CompletedTask);
+
+            // Act
+            await _middleware.InvokeAsync(context);
+
+            // Assert
+            _mockTelemetryClient.Verify(
+                t => t.TrackMetric(It.IsAny<string>(), It.IsAny<double>(), It.IsAny<IDictionary<string, string>>()),
+                Times.Never, // Metrics are batched and flushed separately
+                "Telemetry client should not send metrics immediately."
+            );
+        }
+
+        [TestMethod]
+        public void FlushMetrics_SendsAggregatedMetrics()
+        {
+            // Arrange
+            var metrics = new ConcurrentDictionary<string, ConcurrentBag<long>>();
+            var telemetryClient = new TelemetryClient(new TelemetryConfiguration
+            {
+                InstrumentationKey = "default-instrumentation-key"
+            });
+
+            metrics.TryAdd("test-pod|/test-path", new ConcurrentBag<long> { 10, 20, 30 });
+
+            // Act
+            EntitlementMiddleware.FlushMetrics(null);
+
+            // Assert
+            _mockTelemetryClient.Verify(
+                t => t.TrackMetric("RequestLatency|test-pod|/test-path|Min", 10),
+                Times.Once
+            );
+            _mockTelemetryClient.Verify(
+                t => t.TrackMetric("RequestLatency|test-pod|/test-path|Max", 30),
+                Times.Once
+            );
+            _mockTelemetryClient.Verify(
+                t => t.TrackMetric("RequestLatency|test-pod|/test-path|Average", 20),
+                Times.Once
+            );
+        }
+    }
+}
+
+
+
+####
+
+Dependencies
+To run these tests, ensure the following NuGet packages are added to your test project:
+
+Microsoft.ApplicationInsights
+Microsoft.VisualStudio.TestPlatform.TestFramework
+Moq
+
+
