@@ -173,7 +173,269 @@ Dependencies
 To run these tests, ensure the following NuGet packages are added to your test project:
 
 Microsoft.ApplicationInsights
-Microsoft.VisualStudio.TestPlatform.TestFramework
+Microsoft.VisualStudio.TestPlatform.TestFramewor
 Moq
+
+*****************
+
+using System;
+using System.Collections.Concurrent;
+using System.Diagnostics;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.ApplicationInsights;
+using Microsoft.ApplicationInsights.Extensibility;
+using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.Logging;
+
+namespace Ubs.Acq.PositionService.Middleware
+{
+    public class EntitlementMiddleware
+    {
+        private readonly RequestDelegate _next;
+        private readonly TelemetryClient _telemetryClient;
+        private readonly ILogger<EntitlementMiddleware> _logger;
+
+        private static readonly ConcurrentDictionary<string, ConcurrentBag<long>> LatencyMetrics = new();
+        private static readonly Timer FlushTimer;
+
+        static EntitlementMiddleware()
+        {
+            // Configure the batch timer to flush metrics every 5 minutes
+            FlushTimer = new Timer(FlushMetrics, null, TimeSpan.FromMinutes(5), TimeSpan.FromMinutes(5));
+        }
+
+        public EntitlementMiddleware(RequestDelegate next, TelemetryClient telemetryClient, ILogger<EntitlementMiddleware> logger)
+        {
+            _next = next;
+            _telemetryClient = telemetryClient ?? new TelemetryClient(new TelemetryConfiguration
+            {
+                InstrumentationKey = "default-instrumentation-key" // Default Instrumentation Key
+            });
+            _logger = logger;
+        }
+
+        public async Task InvokeAsync(HttpContext context)
+        {
+            var stopwatch = Stopwatch.StartNew();
+
+            try
+            {
+                _logger.LogInformation("Processing request: {Method} {Path}", context.Request.Method, context.Request.Path);
+                await _next(context);
+            }
+            finally
+            {
+                stopwatch.Stop();
+                long elapsedMilliseconds = stopwatch.ElapsedMilliseconds;
+
+                string podName = Environment.GetEnvironmentVariable("POD_NAME") ?? "default-pod";
+                string key = $"{podName}|{context.Request.Path}";
+
+                var bag = LatencyMetrics.GetOrAdd(key, _ => new ConcurrentBag<long>());
+                bag.Add(elapsedMilliseconds);
+
+                _logger.LogInformation("Request processed: {Path} took {ElapsedMilliseconds} ms", context.Request.Path, elapsedMilliseconds);
+            }
+        }
+
+        private static void FlushMetrics(object state)
+        {
+            try
+            {
+                foreach (var entry in LatencyMetrics.ToArray())
+                {
+                    if (!LatencyMetrics.TryRemove(entry.Key, out var bag) || bag.IsEmpty) continue;
+
+                    var latencies = bag.ToArray();
+                    string[] keyParts = entry.Key.Split('|');
+                    string podName = keyParts[0];
+                    string path = keyParts[1];
+
+                    long min = latencies.Min();
+                    long max = latencies.Max();
+                    double average = latencies.Average();
+
+                    // Log metrics
+                    var telemetryClient = GetTelemetryClient();
+                    telemetryClient.TrackMetric($"RequestLatency|{podName}|{path}|Min", min);
+                    telemetryClient.TrackMetric($"RequestLatency|{podName}|{path}|Max", max);
+                    telemetryClient.TrackMetric($"RequestLatency|{podName}|{path}|Average", average);
+
+                    LogMetricStatistics(podName, path, min, max, average);
+                }
+            }
+            catch (Exception ex)
+            {
+                // Log error during flush
+                GetLogger().LogError(ex, "Error occurred while flushing metrics.");
+            }
+        }
+
+        private static void LogMetricStatistics(string podName, string path, long min, long max, double average)
+        {
+            GetLogger().LogInformation(
+                "Flushed metrics for Pod: {Pod}, Path: {Path} | Min: {Min} ms, Max: {Max} ms, Avg: {Average} ms",
+                podName, path, min, max, average
+            );
+        }
+
+        private static TelemetryClient GetTelemetryClient()
+        {
+            // Mock telemetry instance
+            return new TelemetryClient();
+        }
+    }
+}
+
+************************8
+
+using System.Collections.Concurrent;
+using System.Diagnostics;
+using System.Threading.Tasks;
+using Microsoft.ApplicationInsights;
+using Microsoft.ApplicationInsights.DataContracts;
+using Microsoft.ApplicationInsights.Extensibility;
+using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.Logging;
+using Microsoft.VisualStudio.TestTools.UnitTesting;
+using Moq;
+
+namespace Ubs.Acq.PositionService.Middleware.Tests
+{
+    [TestClass]
+    public class EntitlementMiddlewareTests
+    {
+        private Mock<RequestDelegate> _mockNext;
+        private Mock<TelemetryClient> _mockTelemetryClient;
+        private Mock<ILogger<EntitlementMiddleware>> _mockLogger;
+        private EntitlementMiddleware _middleware;
+
+        [TestInitialize]
+        public void Setup()
+        {
+            _mockNext = new Mock<RequestDelegate>();
+            _mockTelemetryClient = new Mock<TelemetryClient>();
+            _mockLogger = new Mock<ILogger<EntitlementMiddleware>>();
+            _middleware = new EntitlementMiddleware(_mockNext.Object, _mockTelemetryClient.Object, _mockLogger.Object);
+        }
+
+        [TestMethod]
+        public async Task InvokeAsync_ShouldLogAndTrackMetrics()
+        {
+            // Arrange
+            var context = new DefaultHttpContext();
+            context.Request.Path = "/test";
+            context.Request.Method = "GET";
+
+            _mockNext.Setup(n => n(It.IsAny<HttpContext>())).Returns(Task.CompletedTask);
+
+            // Act
+            await _middleware.InvokeAsync(context);
+
+            // Assert
+            _mockLogger.Verify(
+                log => log.Log(
+                    LogLevel.Information,
+                    It.IsAny<EventId>(),
+                    It.Is<It.IsAnyType>((o, t) => o.ToString().Contains("Processing request: GET /test")),
+                    null,
+                    It.IsAny<Func<It.IsAnyType, Exception, string>>()
+                ),
+                Times.Once,
+                "Request start log not written."
+            );
+
+            _mockLogger.Verify(
+                log => log.Log(
+                    LogLevel.Information,
+                    It.IsAny<EventId>(),
+                    It.Is<It.IsAnyType>((o, t) => o.ToString().Contains("Request processed: /test")),
+                    null,
+                    It.IsAny<Func<It.IsAnyType, Exception, string>>()
+                ),
+                Times.Once,
+                "Request completion log not written."
+            );
+        }
+
+        [TestMethod]
+        public void FlushMetrics_ShouldLogMetricsAndSendToTelemetry()
+        {
+            // Arrange
+            var metrics = new ConcurrentDictionary<string, ConcurrentBag<long>>();
+            string key = "default-pod|/test-path";
+            metrics[key] = new ConcurrentBag<long> { 100, 200, 300 };
+
+            typeof(EntitlementMiddleware)
+                .GetField("LatencyMetrics", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static)
+                ?.SetValue(null, metrics);
+
+            // Act
+            typeof(EntitlementMiddleware)
+                .GetMethod("FlushMetrics", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static)
+                ?.Invoke(null, new object[] { null });
+
+            // Assert
+            _mockTelemetryClient.Verify(
+                t => t.TrackMetric("RequestLatency|default-pod|/test-path|Min", 100),
+                Times.Once
+            );
+
+            _mockTelemetryClient.Verify(
+                t => t.TrackMetric("RequestLatency|default-pod|/test-path|Max", 300),
+                Times.Once
+            );
+
+            _mockTelemetryClient.Verify(
+                t => t.TrackMetric("RequestLatency|default-pod|/test-path|Average", 200),
+                Times.Once
+            );
+
+            _mockLogger.Verify(
+                log => log.Log(
+                    LogLevel.Information,
+                    It.IsAny<EventId>(),
+                    It.Is<It.IsAnyType>((o, t) => o.ToString().Contains("Flushed metrics for Pod: default-pod, Path: /test-path")),
+                    null,
+                    It.IsAny<Func<It.IsAnyType, Exception, string>>()
+                ),
+                Times.Once,
+                "Flush metrics log not written."
+            );
+        }
+
+        [TestMethod]
+        public void FlushMetrics_ShouldHandleEmptyMetricsGracefully()
+        {
+            // Arrange
+            var metrics = new ConcurrentDictionary<string, ConcurrentBag<long>>();
+
+            typeof(EntitlementMiddleware)
+                .GetField("LatencyMetrics", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static)
+                ?.SetValue(null, metrics);
+
+            // Act
+            typeof(EntitlementMiddleware)
+                .GetMethod("FlushMetrics", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static)
+                ?.Invoke(null, new object[] { null });
+
+            // Assert
+            _mockLogger.Verify(
+                log => log.Log(
+                    LogLevel.Error,
+                    It.IsAny<EventId>(),
+                    It.IsAny<It.IsAnyType>(),
+                    It.IsAny<Exception>(),
+                    It.IsAny<Func<It.IsAnyType, Exception, string>>()
+                ),
+                Times.Never,
+                "No error log should be written for empty metrics."
+            );
+        }
+    }
+}
+
 
 
